@@ -105,6 +105,104 @@ public sealed class Hex1bNativePublishingTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData("win-x64", "Aspire.Dashboard.exe")]
+    [InlineData("linux-x64", "Aspire.Dashboard")]
+    public async Task BundleReusesPreparedDashboardWithoutPublishing(string rid, string executableName)
+    {
+        var artifactsDirectory = Path.Combine(_workspace.Path, "dashboard-reuse-artifacts");
+        var executable = Path.Combine(GetDashboardPublishDirectory(artifactsDirectory, rid, "Release"), executableName);
+        WriteFile(executable, "prepared-dashboard");
+
+        var result = await RunBundleDashboardTargetAsync(rid, artifactsDirectory, "-p:SkipDashboardPublish=true");
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal("prepared-dashboard", File.ReadAllText(executable));
+    }
+
+    [Theory]
+    [InlineData("win-x64", "Aspire.Dashboard.exe")]
+    [InlineData("linux-x64", "Aspire.Dashboard")]
+    public async Task BundleRequiresPreparedDashboardExecutable(string rid, string executableName)
+    {
+        var artifactsDirectory = Path.Combine(_workspace.Path, "dashboard-missing-artifacts");
+        var publishDirectory = GetDashboardPublishDirectory(artifactsDirectory, rid, "Release");
+        Directory.CreateDirectory(publishDirectory);
+        var expectedExecutable = Path.Combine(publishDirectory, executableName);
+
+        var result = await RunBundleDashboardTargetAsync(rid, artifactsDirectory, "-p:SkipDashboardPublish=true");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains($"Prepared Native AOT Dashboard was not found at '{expectedExecutable}'.", result.Output);
+    }
+
+    [Theory]
+    [InlineData("win-x64", "Aspire.Dashboard.exe", "linux-x64", "Release", "Aspire.Dashboard")]
+    [InlineData("linux-x64", "Aspire.Dashboard", "linux-x64", "Debug", "Aspire.Dashboard")]
+    public async Task BundleRejectsPreparedDashboardFromDifferentRidOrConfiguration(
+        string rid, string executableName, string availableRid, string availableConfiguration, string availableExecutableName)
+    {
+        var artifactsDirectory = Path.Combine(_workspace.Path, "dashboard-mismatched-artifacts");
+        var availableExecutable = Path.Combine(
+            GetDashboardPublishDirectory(artifactsDirectory, availableRid, availableConfiguration),
+            availableExecutableName);
+        WriteFile(availableExecutable, "other-dashboard");
+
+        var expectedDirectory = GetDashboardPublishDirectory(artifactsDirectory, rid, "Release");
+        Directory.CreateDirectory(expectedDirectory);
+        var expectedExecutable = Path.Combine(expectedDirectory, executableName);
+
+        var result = await RunBundleDashboardTargetAsync(rid, artifactsDirectory, "-p:SkipDashboardPublish=true");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains($"Prepared Native AOT Dashboard was not found at '{expectedExecutable}'.", result.Output);
+    }
+
+    [Theory]
+    [InlineData("win-x64", "Aspire.Dashboard.exe", "Aspire.Dashboard")]
+    [InlineData("linux-x64", "Aspire.Dashboard", "Aspire.Dashboard.exe")]
+    public async Task BundleRejectsPreparedDashboardWithWrongExecutableName(
+        string rid, string executableName, string availableExecutableName)
+    {
+        var artifactsDirectory = Path.Combine(_workspace.Path, "dashboard-wrong-executable-artifacts");
+        var publishDirectory = GetDashboardPublishDirectory(artifactsDirectory, rid, "Release");
+        WriteFile(Path.Combine(publishDirectory, availableExecutableName), "wrong-executable");
+        var expectedExecutable = Path.Combine(publishDirectory, executableName);
+
+        var result = await RunBundleDashboardTargetAsync(rid, artifactsDirectory, "-p:SkipDashboardPublish=true");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains($"Prepared Native AOT Dashboard was not found at '{expectedExecutable}'.", result.Output);
+    }
+
+    [Fact]
+    public async Task BundleAttemptsDashboardPublishByDefault()
+    {
+        var artifactsDirectory = Path.Combine(_workspace.Path, "dashboard-default-artifacts");
+
+        var result = await RunBundleDashboardTargetAsync("linux-x64", artifactsDirectory);
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("Publishing Aspire Dashboard (Native AOT)...", result.Output);
+        Assert.Contains("MSB1009", result.Output);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task BundleSkipsDashboardTargetWhenManagedBuildIsSkipped(bool skipDashboardPublish)
+    {
+        var artifactsDirectory = Path.Combine(_workspace.Path, "dashboard-skipped-artifacts");
+
+        var result = await RunBundleDashboardTargetAsync(
+            "linux-x64",
+            artifactsDirectory,
+            "-p:SkipManagedBuild=true",
+            $"-p:SkipDashboardPublish={skipDashboardPublish.ToString().ToLowerInvariant()}");
+
+        Assert.Equal(0, result.ExitCode);
+    }
+
     [Fact]
     public async Task RepositoryTerminalHostMetadataMatchesItsTargetFramework()
     {
@@ -479,6 +577,33 @@ public sealed class Hex1bNativePublishingTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, contents);
+    }
+
+    private static string GetDashboardPublishDirectory(string artifactsDirectory, string rid, string configuration)
+        => Path.Combine(artifactsDirectory, "bin", "Aspire.Dashboard", rid, configuration, "net11.0", rid, "publish");
+
+    private Task<(int ExitCode, string StandardOutput, string StandardError, string Output)> RunBundleDashboardTargetAsync(
+        string rid, string artifactsDirectory, params string[] properties)
+    {
+        var artifactsDirectoryWithSeparator = Path.EndsInDirectorySeparator(artifactsDirectory)
+            ? artifactsDirectory
+            : artifactsDirectory + Path.DirectorySeparatorChar;
+        var arguments = new List<string>
+        {
+            "msbuild",
+            Path.Combine(RepoRoot.Path, "eng", "Bundle.proj"),
+            "-nologo",
+            "-t:_PublishDashboard",
+            $"-p:TargetRid={rid}",
+            "-p:Configuration=Release",
+            "-p:DashboardTargetFramework=net11.0",
+            "-p:ContinuousIntegrationBuild=false",
+            $"-p:ArtifactsDir={artifactsDirectoryWithSeparator}",
+            $"-p:DashboardProjectPath={Path.Combine(_workspace.Path, "MissingDashboard.csproj")}"
+        };
+        arguments.AddRange(properties);
+
+        return RunDotNetAsync([.. arguments]);
     }
 
     private async Task<(int ExitCode, string StandardOutput, string StandardError, string Output)> RunDotNetAsync(
