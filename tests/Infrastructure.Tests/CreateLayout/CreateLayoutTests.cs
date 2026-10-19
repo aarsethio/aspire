@@ -1,6 +1,7 @@
 // Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 
+using System.Diagnostics;
 using Aspire.Tools.CreateLayout;
 using Xunit;
 
@@ -113,6 +114,82 @@ public class CreateLayoutTests(ITestOutputHelper testOutputHelper)
 
         Assert.Equal(1, exitCode);
         Assert.False(Directory.Exists(outputPath));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Main_UsesExplicitDashboardInsteadOfDiscoverablePayload(bool missing)
+    {
+        const string rid = "linux-x64";
+        using var workspace = TemporaryWorkspace.Create(testOutputHelper);
+        var artifacts = Path.Combine(workspace.Path, "artifacts");
+        WriteFile(Path.Combine(artifacts, "bin", "Aspire.Managed", "Release", "net10.0", rid, "publish", "aspire-managed"), "managed");
+        foreach (var file in Aspire.Shared.TerminalHostPayload.GetRequiredFiles(rid))
+        {
+            WriteFile(Path.Combine(artifacts, "bin", "Aspire.TerminalHost", "Release", "net11.0", rid, "publish", file), file);
+        }
+        var explicitPath = Path.Combine(workspace.Path, "prepared Dashboard with spaces");
+        var discoveredPath = Path.Combine(artifacts, "bin", "Aspire.Dashboard", rid, "Release", "net11.0", rid, "publish");
+        foreach (var file in new[] { "Aspire.Dashboard", "libe_sqlite3.so", "wwwroot/_framework/blazor.web.js" })
+        {
+            WriteFile(Path.Combine(discoveredPath, file), "discoverable");
+            if (!missing)
+            {
+                WriteFile(Path.Combine(explicitPath, file), "explicit");
+            }
+        }
+        var packages = Path.Combine(workspace.Path, "packages");
+        WriteFile(Path.Combine(packages, "microsoft.developercontrolplane.linux-amd64", "1.0.0", "tools", "dcp"), "dcp");
+        var layout = Path.Combine(workspace.Path, "layout");
+        var testAssembly = typeof(CreateLayoutTests).Assembly.Location;
+        var startInfo = new ProcessStartInfo(Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? "dotnet")
+        {
+            WorkingDirectory = workspace.Path,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        foreach (var argument in new[]
+        {
+            "exec", "--runtimeconfig", Path.ChangeExtension(testAssembly, ".runtimeconfig.json"),
+            "--depsfile", Path.ChangeExtension(testAssembly, ".deps.json"),
+            typeof(Aspire.Tools.CreateLayout.Program).Assembly.Location,
+            "--output", layout, "--artifacts", artifacts, "--rid", rid, "--configuration", "Release",
+            "--dashboard", explicitPath
+        })
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+        startInfo.Environment["NUGET_PACKAGES"] = packages;
+
+        using var process = Process.Start(startInfo)!;
+        var standardOutput = process.StandardOutput.ReadToEndAsync();
+        var standardError = process.StandardError.ReadToEndAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            process.Kill(entireProcessTree: true);
+            throw;
+        }
+        var output = await standardOutput + await standardError;
+        testOutputHelper.WriteLine(output);
+
+        Assert.Equal(!missing, process.ExitCode == 0);
+        if (missing)
+        {
+            Assert.Contains(explicitPath, output);
+            Assert.False(Directory.Exists(Path.Combine(layout, "dashboard")));
+        }
+        else
+        {
+            Assert.Equal("explicit", File.ReadAllText(Path.Combine(layout, "dashboard", "Aspire.Dashboard")));
+            Assert.Equal("dcp", File.ReadAllText(Path.Combine(layout, "dcp", "dcp")));
+        }
     }
 
     [Theory]
@@ -240,6 +317,62 @@ public class CreateLayoutTests(ITestOutputHelper testOutputHelper)
         Assert.False(Directory.Exists(Path.Combine(outputPath, "dashboard")));
     }
 
+    [Fact]
+    public void CopyDashboard_ExplicitDirectoryPreservesPayloadFiltering()
+    {
+        using var workspace = TemporaryWorkspace.Create(testOutputHelper);
+        var publish = CreateDashboardPublishOutput(workspace.Path, "win-x64", "e_sqlite3.dll");
+        var explicitPath = Path.Combine(workspace.Path, "prepared dashboard outside artifacts");
+        Directory.Move(publish, explicitPath);
+        File.WriteAllText(Path.Combine(explicitPath, "Aspire.Dashboard.exe"), "explicit executable");
+        File.WriteAllText(Path.Combine(explicitPath, "Aspire.Dashboard.pdb"), "symbols");
+        Directory.CreateDirectory(Path.Combine(explicitPath, "nested.dSYM"));
+        File.WriteAllText(Path.Combine(explicitPath, "nested.dSYM", "symbols"), "symbols");
+        File.WriteAllText(Path.Combine(explicitPath, "Aspire.Dashboard.dbg"), "symbols");
+        var output = Path.Combine(workspace.Path, "layout");
+        using var builder = new LayoutBuilder(output, workspace.Path, "win-x64", "Debug", "1.0", false, null, null, explicitPath);
+
+        builder.CopyDashboard();
+
+        var dashboard = Path.Combine(output, "dashboard");
+        Assert.Equal(["Aspire.Dashboard.exe", "e_sqlite3.dll", "wwwroot/_framework/blazor.web.js"],
+            Directory.GetFiles(dashboard, "*", SearchOption.AllDirectories)
+                .Select(path => Path.GetRelativePath(dashboard, path).Replace('\\', '/')).Order(StringComparer.Ordinal));
+        Assert.Equal("explicit executable", File.ReadAllText(Path.Combine(dashboard, "Aspire.Dashboard.exe")));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    [InlineData("\t")]
+    public void CopyDashboard_EmptyExplicitDirectoryIsRejected(string path)
+    {
+        using var workspace = TemporaryWorkspace.Create(testOutputHelper);
+        CreateDashboardPublishOutput(workspace.Path, "win-x64", "e_sqlite3.dll");
+        var exception = Assert.Throws<InvalidOperationException>(() =>
+            new LayoutBuilder(Path.Combine(workspace.Path, "layout"), workspace.Path,
+                "win-x64", "Debug", "1.0", false, null, null, path));
+
+        Assert.Equal("--dashboard requires a nonempty publish directory.", exception.Message);
+    }
+
+    [Fact]
+    public void CopyDashboard_DiscoveryFailureIdentifiesSearchLocations()
+    {
+        using var workspace = TemporaryWorkspace.Create(testOutputHelper);
+        using var builder = new LayoutBuilder(Path.Combine(workspace.Path, "layout"), workspace.Path,
+            "win-x64", "Debug", "1.0", false, null, null);
+
+        var exception = Assert.Throws<InvalidOperationException>(builder.CopyDashboard);
+
+        Assert.Contains("win-x64", exception.Message);
+        Assert.Contains("Debug", exception.Message);
+        foreach (var path in GetPublishPaths(workspace.Path, "Debug")[..^1])
+        {
+            Assert.Contains(path, exception.Message);
+        }
+    }
+
     private static string CreateDashboardPublishOutput(string artifactsPath, string rid, string sqliteLibraryName)
     {
         var publishPath = Path.Combine(artifactsPath, "bin", "Aspire.Dashboard", rid, "Debug", "net11.0", rid, "publish");
@@ -260,4 +393,10 @@ public class CreateLayoutTests(ITestOutputHelper testOutputHelper)
         Path.Combine(artifactsPath, "bin", "Aspire.Dashboard", configuration, "net11.0", "win-x64", "native"),
         Path.Combine(artifactsPath, "bin", "Aspire.Dashboard", configuration, "net11.0", "publish")
     ];
+
+    private static void WriteFile(string path, string contents)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, contents);
+    }
 }
