@@ -162,11 +162,12 @@ public static class GoHostingExtensions
             // Go doesn't support appending to its default trust on macOS and Windows: since Go 1.27 (for
             // modules declaring go 1.27 or later), setting SSL_CERT_FILE or SSL_CERT_DIR there replaces the
             // platform verifier with roots loaded from disk, and those platforms have no default cert files.
-            // Use System so the bundle Go loads also contains the system roots. Append would still work on
-            // Linux, but System is used on every OS to match the Python and Java integrations, whose runtimes
-            // also replace the default roots when pointed at a bundle.
+            // Use System there so the bundle Go loads also contains the system roots. Linux keeps Append
+            // because Go still loads the default bundle file alongside SSL_CERT_DIR.
             // See https://go.dev/doc/go1.27 and https://github.com/microsoft/aspire/issues/21198.
-            .WithCertificateTrustScope(CertificateTrustScope.System)
+            .WithCertificateTrustScope(OperatingSystem.IsMacOS() || OperatingSystem.IsWindows()
+                ? CertificateTrustScope.System
+                : CertificateTrustScope.Append)
             .WithCertificateTrustConfiguration(ctx =>
             {
                 // Linux still loads the default bundle file next to SSL_CERT_DIR, so Append works there.

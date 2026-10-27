@@ -1184,7 +1184,7 @@ public class AddGoAppTests(ITestOutputHelper outputHelper)
     }
 
     [Fact]
-    public void AddGoApp_RequestsSystemCertificateTrustScope()
+    public void AddGoApp_RequestsPlatformCertificateTrustScope()
     {
         using var builder = TestDistributedApplicationBuilder.Create().WithResourceCleanUp(true);
 
@@ -1193,9 +1193,12 @@ public class AddGoAppTests(ITestOutputHelper outputHelper)
         // On macOS and Windows, setting SSL_CERT_DIR makes Go load roots only from disk instead of the
         // platform verifier, and those platforms have no default cert files. Under the default Append
         // scope Go would then trust only Aspire's own certificates, so the bundle must include the
-        // system roots as well.
+        // system roots as well. Linux still loads its default bundle file, so Append works there.
+        var expectedScope = OperatingSystem.IsMacOS() || OperatingSystem.IsWindows()
+            ? CertificateTrustScope.System
+            : CertificateTrustScope.Append;
         Assert.True(app.Resource.TryGetLastAnnotation<CertificateAuthorityCollectionAnnotation>(out var certAnnotation));
-        Assert.Equal(CertificateTrustScope.System, certAnnotation.Scope);
+        Assert.Equal(expectedScope, certAnnotation.Scope);
     }
 
     [Fact]
